@@ -2,9 +2,10 @@ from typing import Sequence
 
 import aesops.business_logic.match as m_logic
 import aesops.business_logic.players as p_logic
-from data_models.match import Match
+from data_models.match import Match, MatchResult
 from data_models.model_store import db, Tournament
 from data_models.players import Player
+from random import shuffle
 
 
 def add_player(
@@ -30,14 +31,124 @@ def add_player(
     return p
 
 
+# TODO: Can this be safely cached?
+def get_record_from_memory(player: Player, matches: dict, count_byes=True):
+    score = 0
+    games_played = 0
+    for match in player.runner_matches:
+        mem_match = matches[match.id]
+        if mem_match.result == MatchResult.RUNNER_WIN.value and mem_match.concluded:
+            score += 3
+        if (
+            mem_match.result
+            in [MatchResult.DRAW.value, MatchResult.INTENTIONAL_DRAW.value]
+            and mem_match.concluded
+        ):
+            score += 1
+        games_played += 1
+    for match in player.corp_matches:
+        mem_match = matches[match.id]
+        if mem_match.result == MatchResult.CORP_WIN.value and mem_match.concluded:
+            score += 3
+        if (
+            mem_match.result
+            in [MatchResult.DRAW.value, MatchResult.INTENTIONAL_DRAW.value]
+            and mem_match.concluded
+        ):
+            score += 1
+        if count_byes or not mem_match.is_bye:
+            games_played += 1
+    return {"score": score, "games_played": games_played}
+
+
+def update_score_from_memory(player: Player, matches=dict):
+    return get_record_from_memory(player, matches)["score"]
+
+
+def get_average_score_from_memory(player: Player, matches: dict):
+    record = get_record_from_memory(player, matches, count_byes=False)
+    return record["score"] / max(record["games_played"], 1)
+
+
+def update_sos_from_memory(player: Player, matches: dict, players: dict):
+    opp_average_score = sum(
+        [
+            get_average_score_from_memory(players[m.corp_player_id], matches=matches)
+            for m in player.runner_matches
+        ]
+    )
+    opp_average_score += sum(
+        [
+            get_average_score_from_memory(players[m.runner_player_id], matches=matches)
+            for m in player.corp_matches
+            if m.is_bye == False
+        ]
+    )
+    return round(
+        opp_average_score
+        / max(
+            get_record_from_memory(player, matches=matches, count_byes=False)[
+                "games_played"
+            ],
+            1,
+        ),
+        3,
+    )
+
+
+def get_opponent(player: Player, match: Match, players: dict):
+    if match.corp_player_id == player.id:
+        return players[match.runner_player.id]
+    return players[match.corp_player.id]
+
+
+def update_esos_from_memory(player: Player, matches: dict, players: dict):
+    opp_total_sos = sum(
+        [
+            get_opponent(player, match=m, players=players).sos
+            for m in player.runner_matches
+        ]
+    )
+    opp_total_sos += sum(
+        [
+            get_opponent(player, match=m, players=players).sos
+            for m in player.corp_matches
+            if m.is_bye == False
+        ]
+    )
+    return round(
+        opp_total_sos
+        / max(
+            get_record_from_memory(player, matches=matches, count_byes=False)[
+                "games_played"
+            ],
+            1,
+        ),
+        3,
+    )
+
+
 def conclude_round(tournament: Tournament):
     for match in tournament.active_matches:
         m_logic.conclude(match)
+    local_players = {p.id: p for p in tournament.players}
+    matches = {m.id: m for m in tournament.matches}
+    for player in local_players.values():
+        player.score = update_score_from_memory(player, matches)
+        db.session.add(player)
+    db.session.commit()
     for player in tournament.players:
-        p_logic.update_score(player)
-        p_logic.update_sos_esos(player)
+        player.sos = update_sos_from_memory(player, matches, local_players)
+        db.session.add(player)
+    db.session.commit()
+
+    for player in tournament.players:
+        player.esos = update_esos_from_memory(player, matches, local_players)
+        db.session.add(player)
+    db.session.commit()
     db.session.add(tournament)
     db.session.commit()
+    return tournament
 
 
 def rank_players(tournament: Tournament) -> list[Player]:
@@ -67,6 +178,7 @@ def bye_setup(tournament: Tournament) -> tuple[list[Player], Player]:
         ]
     else:
         elible_player_list = [p for p in player_list if not p.recieved_bye and p.active]
+        shuffle(elible_player_list)
     if len(elible_player_list) == 0:
         elible_player_list = least_byes(tournament, player_list)
     elible_player_list.sort(key=lambda x: p_logic.get_record(x)["score"], reverse=True)
@@ -101,6 +213,7 @@ def unpair_round(tournament: Tournament):
     tournament.current_round -= 1
     db.session.add(tournament)
     db.session.commit()
+    conclude_round(tournament)  # calling this to recalculate scores
     return tournament
 
 
